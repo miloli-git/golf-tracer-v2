@@ -189,6 +189,11 @@ def fit_track(track: Track, config: Config | None = None) -> FittedPath | None:
     if len(observations) < 2:
         return None
     if track.phase == "ball":
+        # Human correction labels are exact model constraints. Always render
+        # their fitted support sequence as an interpolating spatial path so the
+        # normal one-pixel time-spline smoothing cannot move a trusted click.
+        if track.metadata.get("label_constrained"):
+            return FittedPath([_fit_spatial_piece(observations)])
         # The v1-parity drawing is a cubic time-spline, and it folds into
         # loops on sparse tracks with frame gaps or repeated coordinates
         # (v1 has the same pathology). By default such tracks use an

@@ -13,7 +13,9 @@ from scipy.optimize import least_squares
 from ..candidates import CandidateConfig, candidate_overlay, extract_candidate_observations
 from ..config import Config
 from ..decode import read_window_pts
-from ..session import AuditFrame, AuditReport, OBSERVED, Observation, Swing
+from ..session import (
+    AuditFrame, AuditReport, LABELLED, OBSERVED, Observation, Swing,
+)
 from ..stabilize import stabilize_frames
 from .base import Phase
 
@@ -731,11 +733,21 @@ class BallFit:
     v: tuple[float, ...]
     inliers: tuple[bool, ...]
     rmse_px: float
+    correction_times: tuple[float, ...] = ()
+    correction_u: tuple[float, ...] = ()
+    correction_v: tuple[float, ...] = ()
 
     def predict(self, times: float | Sequence[float]) -> np.ndarray:
         values = np.atleast_1d(np.asarray(times, float))
         x = (values - self.t_origin) / self.t_scale
         result = np.column_stack((np.polynomial.polynomial.polyval(x, self.u), np.polynomial.polynomial.polyval(x, self.v)))
+        if self.correction_times:
+            result[:, 0] += np.interp(
+                values, self.correction_times, self.correction_u,
+            )
+            result[:, 1] += np.interp(
+                values, self.correction_times, self.correction_v,
+            )
         return result[0] if np.ndim(times) == 0 else result
 
 
@@ -758,6 +770,77 @@ def robust_fit_2d(observations: Sequence[Observation], degree: int = 2) -> BallF
     centre = float(np.median(errors)); sigma = 1.4826 * float(np.median(np.abs(errors - centre)))
     inliers = errors <= max(4.0, centre + 3.0 * max(1.0, sigma))
     return BallFit(origin, scale, tuple(solved.x[:degree + 1]), tuple(solved.x[degree + 1:]), tuple(bool(value) for value in inliers), float(np.sqrt(np.mean(errors[inliers] ** 2))))
+
+
+def label_constrained_fit(
+    observations: Sequence[Observation], labels: Sequence[Any], degree: int = 2,
+) -> BallFit | None:
+    """Fit observed flight softly, then apply exact human correction residuals."""
+    by_frame = {int(item.frame_index): item for item in labels}
+    trusted = [by_frame[key] for key in sorted(by_frame)]
+    supports: list[Observation] = list(observations)
+    if len(supports) < 3:
+        supports = [
+            Observation(
+                int(item.frame_index), float(item.t), float(item.x), float(item.y),
+                source=str(getattr(item, "source", "human")),
+            )
+            for item in trusted
+        ]
+    if len(supports) < 3:
+        return None
+    base = robust_fit_2d(supports, degree=degree)
+    if not trusted:
+        return base
+
+    label_times = np.asarray([float(item.t) for item in trusted], dtype=float)
+    label_xy = np.asarray([(float(item.x), float(item.y)) for item in trusted])
+    offsets = label_xy - base.predict(label_times)
+    corrections: dict[float, tuple[float, float]] = {
+        float(timestamp): (float(offset[0]), float(offset[1]))
+        for timestamp, offset in zip(label_times, offsets, strict=True)
+    }
+    ordered_observations = sorted(observations, key=lambda item: item.t)
+    before = [item for item in ordered_observations if item.t < label_times[0]]
+    after = [item for item in ordered_observations if item.t > label_times[-1]]
+    # A neighbouring zero-residual knot tapers a local correction into the
+    # autonomous fit. With no evidence on one side, the nearest human residual
+    # remains in force instead of snapping the flight back to a suspect track.
+    if before:
+        corrections[float(before[-1].t)] = (0.0, 0.0)
+    if after:
+        corrections[float(after[0].t)] = (0.0, 0.0)
+    correction_times = tuple(sorted(corrections))
+    return BallFit(
+        base.t_origin, base.t_scale, base.u, base.v, base.inliers, base.rmse_px,
+        correction_times,
+        tuple(corrections[item][0] for item in correction_times),
+        tuple(corrections[item][1] for item in correction_times),
+    )
+
+
+def constrained_observations(
+    observations: Sequence[Observation], labels: Sequence[Any], fit: BallFit,
+) -> list[Observation]:
+    """Return fitted render knots, with human labels winning frame collisions."""
+    supports: dict[int, tuple[float, str, float]] = {
+        item.frame_index: (item.t, "interpolated", item.confidence)
+        for item in observations
+    }
+    for item in labels:
+        supports[int(item.frame_index)] = (
+            float(item.t), str(getattr(item, "source", "human")), 1.0,
+        )
+    result: list[Observation] = []
+    for frame, (timestamp, source, confidence) in sorted(
+        supports.items(), key=lambda item: (item[1][0], item[0]),
+    ):
+        point = fit.predict(timestamp)
+        result.append(Observation(
+            frame, timestamp, float(point[0]), float(point[1]),
+            confidence, source,
+        ))
+    return result
 
 
 class BallPhase(Phase):
@@ -955,8 +1038,7 @@ class BallPhase(Phase):
         )
 
     def fit(self, observations: Sequence[Observation], labels: Sequence[Any]) -> BallFit | None:
-        del labels
-        return robust_fit_2d(observations) if len(observations) >= 3 else None
+        return label_constrained_fit(observations, labels)
 
     def retime(self, spline: BallFit, frames: np.ndarray, *, fps: float, start_t: float) -> list[Observation]:
         times = start_t + np.arange(len(frames)) / fps
@@ -967,8 +1049,38 @@ class BallPhase(Phase):
         return {"min_rise_px": self.config.ball_min_rise_px, "shaft_rule": self.config.ball_shaft_rule_enabled}
 
     def audit(self, positions: Sequence[Observation], labels: Sequence[Any], observations: Sequence[Observation] = ()) -> AuditReport:
-        del labels, observations
+        del observations
         if self.abstained:
             return AuditReport(True, metrics={"abstained": 1.0}, failures=[])
+        if labels:
+            labels_by_frame = {int(item.frame_index): item for item in labels}
+            rows: list[AuditFrame] = []
+            residuals: list[float] = []
+            for item in positions:
+                label = labels_by_frame.get(item.frame_index)
+                if label is None:
+                    rows.append(AuditFrame(item.frame_index, item.t, OBSERVED))
+                    continue
+                residual = float(np.hypot(item.x - label.x, item.y - label.y))
+                residuals.append(residual)
+                rows.append(AuditFrame(
+                    item.frame_index, item.t, LABELLED, residual,
+                ))
+            maximum = max(residuals, default=float("inf"))
+            passed = (
+                bool(rows) and len(residuals) == len(labels_by_frame)
+                and maximum <= 1e-6
+            )
+            return AuditReport(
+                passed,
+                [] if passed else ["ball label constraints were not preserved"],
+                {
+                    "frames": float(len(rows)), "abstained": 0.0,
+                    "labels": float(len(labels_by_frame)),
+                    "max_label_residual_px": maximum,
+                    "rms_label_residual_px": float(np.sqrt(np.mean(np.square(residuals)))) if residuals else float("inf"),
+                },
+                rows,
+            )
         rows = [AuditFrame(item.frame_index, item.t, OBSERVED) for item in positions]
         return AuditReport(bool(rows), [] if rows else ["tracked ball has no positions"], {"frames": float(len(rows)), "abstained": 0.0}, rows)

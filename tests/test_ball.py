@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from golftracer.config import Config
+from golftracer.label.schema import Label, LabelDocument, save_labels
 from golftracer.phases import ball
-from golftracer.session import Session, Swing
+from golftracer.render.compositor import fit_track
+from golftracer.session import Observation, Session, Swing
 from golftracer.tracking import _ball_track
 
 
@@ -132,6 +135,72 @@ def test_ball_phase_impact_source_is_swing_not_club_handoff(monkeypatch) -> None
     session = Session("fixture.mp4", 100, 100, 60.0, 2.0, 0, swings=[swing])
     _ball_track(session, swing, Config(), None, tee_xy=(50.0, 80.0))
     assert seen == [1.25]
+
+
+def test_ball_labels_are_exact_fit_and_render_constraints(tmp_path, monkeypatch) -> None:
+    raw = [
+        Observation(frame, 10.0 + frame / 60.0, 400.0 + frame * 2.0,
+                    1300.0 - frame * 24.0, source="observed")
+        for frame in (1, 3, 5, 7, 9, 11)
+    ]
+    labels = [
+        Label(7, 10.0 + 7 / 60.0, 455.0, 1090.0, "ball"),
+        Label(11, 10.0 + 11 / 60.0, 510.0, 940.0, "ball"),
+    ]
+    save_labels(
+        tmp_path / "1.ball.json",
+        LabelDocument("fixture.mp4", 10.0, 60.0, "ball", labels),
+    )
+
+    def fake_track_video(self, _video, _swing, _config):
+        self.abstained = False
+        self.reason = None
+        return raw
+
+    monkeypatch.setattr(ball.BallPhase, "track_video", fake_track_video)
+    swing = Swing(1, 9.0, 12.0, 10.0)
+    session = Session("fixture.mp4", 1080, 1920, 60.0, 12.0, 0, swings=[swing])
+    track = _ball_track(
+        session, swing, Config(), None, tee_xy=(400.0, 1400.0),
+        labels_root=tmp_path,
+    )
+
+    assert track.metadata["label_constraint_mode"] == "exact_residual_correction"
+    assert track.audit.passed
+    assert track.audit.metrics["max_label_residual_px"] <= 1e-9
+    fitted = fit_track(track, Config())
+    assert fitted is not None
+    for label in labels:
+        point = fitted.pieces[0].xy(label.t)
+        assert point == pytest.approx((label.x, label.y), abs=1e-3)
+    assert next(item for item in track.observations if item.frame_index == 7).y != raw[3].y
+
+
+def test_ball_track_without_labels_is_unchanged(monkeypatch) -> None:
+    raw = [
+        Observation(1, 2.01, 100.0, 500.0, source="observed"),
+        Observation(4, 2.04, 105.0, 420.0, source="observed"),
+        Observation(8, 2.08, 112.0, 330.0, source="observed"),
+    ]
+
+    def fake_track_video(self, _video, _swing, _config):
+        self.abstained = False
+        self.reason = None
+        self.metrics = {"n_observed": 3}
+        return raw
+
+    monkeypatch.setattr(ball.BallPhase, "track_video", fake_track_video)
+    swing = Swing(1, 1.0, 3.0, 2.0)
+    session = Session("fixture.mp4", 100, 100, 60.0, 3.0, 0, swings=[swing])
+    track = _ball_track(session, swing, Config(), None, tee_xy=(50.0, 80.0))
+
+    assert track.observations == raw
+    assert track.metadata == {
+        "tee_xy": (50.0, 80.0), "n_observed": 3,
+        "shaft_rule_fired": False,
+    }
+    assert track.audit.metrics == {"frames": 3.0, "abstained": 0.0}
+    assert "label_constrained" not in track.metadata
 
 
 def test_drop_static_repeats_keeps_pairs_drops_dwells() -> None:

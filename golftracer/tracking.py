@@ -17,7 +17,7 @@ from .config import Config
 from .decode import decode_window
 from .label.schema import Label, LabelDocument, load_labels
 from .phases import BackswingPhase, BallPhase, DownswingPhase, FollowthroughPhase
-from .phases.ball import estimate_session_tees
+from .phases.ball import constrained_observations, estimate_session_tees
 from .phases.followthrough import detect_finish
 LOG = logging.getLogger(__name__)
 
@@ -676,6 +676,7 @@ def _ball_track(
     session: Session, swing: Swing, config: Config, debug_dir: Path | None,
     tee_roi: tuple[int, int, int, int] | None = None,
     tee_xy: tuple[float, float] | None = None,
+    labels_root: Path | None = None,
 ) -> Track:
     start, duration = _phase_window(swing, "ball", config)
     local = replace(swing, window_start=start, window_end=start + duration)
@@ -683,8 +684,26 @@ def _ball_track(
         config, tee_roi=tee_roi, tee_xy=tee_xy, debug_dir=debug_dir,
     )
     observations = phase.track_video(session.video, local, config)
-    audit = phase.audit(observations, (), observations)
+    labels = labels_for(labels_root, swing.id, "ball")
+    raw_observations = observations
+    label_fit_applied = False
+    if labels:
+        fit = phase.fit(raw_observations, labels)
+        if fit is not None:
+            observations = constrained_observations(raw_observations, labels, fit)
+            phase.abstained = False
+            phase.reason = None
+            label_fit_applied = True
+    audit = phase.audit(observations, labels, raw_observations)
     metadata = {"tee_xy": phase.tee_xy, **phase.metrics, "shaft_rule_fired": phase.shaft_rule_fired}
+    if label_fit_applied:
+        metadata.update({
+            "label_constrained": True,
+            "label_constraint_mode": "exact_residual_correction",
+            "n_ball_labels": len({item.frame_index for item in labels}),
+            "max_label_residual_px": audit.metrics.get("max_label_residual_px"),
+            "rms_label_residual_px": audit.metrics.get("rms_label_residual_px"),
+        })
     return Track("ball", observations, audit, metadata, phase.abstained, phase.reason)
 
 
@@ -711,7 +730,7 @@ def _track_ball_stage(task: _WorkerTask) -> Swing:
     swing = task.swing
     swing.tracks.append(_ball_track(
         task.session, swing, task.config, task.debug_dir, task.tee_roi,
-        task.tee_xy,
+        task.tee_xy, task.labels_root,
     ))
     return swing
 
@@ -954,6 +973,7 @@ def track_session(
                 outcome = worker.run(_WorkerTask(
                     "ball", shell, config, swing=swing, debug_dir=root,
                     tee_roi=tee_roi, tee_xy=tee_table.get(float(swing.impact_t)),
+                    labels_root=labels_root,
                 ), remaining[swing.id])
                 remaining[swing.id] = max(0.0, remaining[swing.id] - outcome.elapsed_s)
                 if outcome.failure is not None:
