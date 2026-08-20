@@ -23,6 +23,10 @@ class Config:
     downswing_pre_s: float = 0.35
     ball_post_s: float = 1.50
     follow_through_post_s: float = 1.50
+    # Hard wall-clock ceiling for one swing's tracking work. The worker process
+    # is terminated on expiry so arbitrary native OpenCV/NumPy work cannot hold
+    # the session loop indefinitely.
+    track_swing_timeout_s: float = 600.0
 
     # Club phase fitting/retiming. Values are the measured v1 calibration defaults.
     club_label_weight: float = 25.0

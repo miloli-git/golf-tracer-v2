@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import logging
+import multiprocessing as mp
+from multiprocessing.connection import Connection
 from pathlib import Path
+import time
 from typing import Iterable, Sequence
 
 import cv2
@@ -15,7 +19,6 @@ from .label.schema import Label, LabelDocument, load_labels
 from .phases import BackswingPhase, BallPhase, DownswingPhase, FollowthroughPhase
 from .phases.ball import estimate_session_tees
 from .phases.followthrough import detect_finish
-import logging
 LOG = logging.getLogger(__name__)
 
 from .phases.base import (
@@ -30,6 +33,8 @@ from .session import AuditReport, Observation, Session, Swing, Track
 
 
 PHASES = ("backswing", "downswing", "followthrough", "ball")
+_TRACK_PHASES = {"club", "follow", "ball", "swing"}
+_WORKER_START_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -41,6 +46,36 @@ class ClubSpatialFit:
     accepted: list[Constraint]
     rejected: list[Constraint]
     label_smoothing_px: float
+
+
+@dataclass(frozen=True)
+class _WorkerFailure:
+    reason: str
+    stage: str
+
+
+@dataclass
+class _WorkerTask:
+    operation: str
+    session: Session
+    config: Config
+    swing: Swing | None = None
+    selected: tuple[str, ...] = ()
+    labels_root: Path | None = None
+    debug_dir: Path | None = None
+    tee_roi: tuple[int, int, int, int] | None = None
+    tee_xy: tuple[float, float] | None = None
+    detector_weights: Path | None = None
+    impact_times: tuple[float, ...] = ()
+    shot_priors: dict[float, tuple[float, float]] | None = None
+    measurement_times: dict[float, float] | None = None
+
+
+@dataclass(frozen=True)
+class _WorkerOutcome:
+    value: object | None
+    failure: _WorkerFailure | None
+    elapsed_s: float
 
 
 def phase_biases_from_v1_samples(samples: Sequence[dict]) -> dict[str, tuple[float, float]]:
@@ -589,6 +624,193 @@ def _ball_track(
     return Track("ball", observations, audit, metadata, phase.abstained, phase.reason)
 
 
+def _track_club_stage(task: _WorkerTask) -> Swing:
+    if task.swing is None:
+        raise ValueError("club task requires a swing")
+    swing = task.swing
+    club = _club_track(
+        task.session, swing, task.config, task.selected, task.labels_root,
+    )
+    if club is not None:
+        swing.tracks.append(club)
+        if "followthrough" in task.selected and not club.abstained:
+            swing.tracks.append(_follow_track(
+                task.session, swing, club, task.config, task.labels_root,
+                task.detector_weights,
+            ))
+    return swing
+
+
+def _track_ball_stage(task: _WorkerTask) -> Swing:
+    if task.swing is None:
+        raise ValueError("ball task requires a swing")
+    swing = task.swing
+    swing.tracks.append(_ball_track(
+        task.session, swing, task.config, task.debug_dir, task.tee_roi,
+        task.tee_xy,
+    ))
+    return swing
+
+
+def _estimate_tee_table(task: _WorkerTask) -> dict[float, tuple[float, float] | None]:
+    return estimate_session_tees(
+        task.session.video, task.impact_times, task.config, roi=task.tee_roi,
+        prior_xy_by_impact=task.shot_priors,
+        measurement_time_by_impact=task.measurement_times,
+    )
+
+
+def _swing_worker_loop(connection: Connection) -> None:
+    """Run tracking tasks in an expendable Windows-spawn-compatible process."""
+    connection.send(("ready", None))
+    try:
+        while True:
+            try:
+                task = connection.recv()
+            except EOFError:
+                break
+            if task is None:
+                break
+            try:
+                if task.operation == "club":
+                    result = _track_club_stage(task)
+                elif task.operation == "ball":
+                    result = _track_ball_stage(task)
+                elif task.operation == "tee_table":
+                    result = _estimate_tee_table(task)
+                else:
+                    raise ValueError(f"unknown worker operation: {task.operation}")
+                connection.send(("ok", result))
+            except MemoryError:
+                connection.send(("error", _WorkerFailure("memory_error", task.operation)))
+            except Exception:
+                LOG.exception("tracking worker failed during %s", task.operation)
+                connection.send(("error", _WorkerFailure("unexpected_exception", task.operation)))
+    finally:
+        connection.close()
+
+
+class _SwingWorker:
+    """Supervise a persistent worker and replace it after any failed task."""
+
+    def __init__(self) -> None:
+        self._context = mp.get_context("spawn")
+        self._connection: Connection | None = None
+        self._process: mp.Process | None = None
+
+    def _stop(self, *, graceful: bool) -> None:
+        connection, process = self._connection, self._process
+        self._connection = None
+        self._process = None
+        if process is None:
+            if connection is not None:
+                connection.close()
+            return
+        if graceful and connection is not None and process.is_alive():
+            try:
+                connection.send(None)
+            except (BrokenPipeError, EOFError, OSError):
+                pass
+        process.join(timeout=5.0 if graceful else 0.0)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5.0)
+        if process.is_alive():
+            process.kill()
+            process.join(timeout=5.0)
+        if connection is not None:
+            connection.close()
+
+    def _start(self) -> bool:
+        if self._process is not None and self._process.is_alive():
+            return True
+        self._stop(graceful=False)
+        parent, child = self._context.Pipe(duplex=True)
+        process = self._context.Process(target=_swing_worker_loop, args=(child,))
+        try:
+            process.start()
+        except Exception:
+            parent.close()
+            child.close()
+            LOG.exception("could not start tracking worker")
+            return False
+        child.close()
+        self._connection = parent
+        self._process = process
+        try:
+            if not parent.poll(_WORKER_START_TIMEOUT_S):
+                LOG.error("tracking worker did not become ready")
+                self._stop(graceful=False)
+                return False
+            status, _payload = parent.recv()
+        except (EOFError, OSError):
+            LOG.exception("tracking worker exited during startup")
+            self._stop(graceful=False)
+            return False
+        if status != "ready":
+            LOG.error("tracking worker returned an invalid startup response")
+            self._stop(graceful=False)
+            return False
+        return True
+
+    def run(self, task: _WorkerTask, timeout_s: float) -> _WorkerOutcome:
+        if not self._start():
+            return _WorkerOutcome(None, _WorkerFailure("worker_exit", task.operation), 0.0)
+        assert self._connection is not None
+        started = time.monotonic()
+        try:
+            self._connection.send(task)
+            if not self._connection.poll(max(0.0, float(timeout_s))):
+                elapsed = time.monotonic() - started
+                self._stop(graceful=False)
+                return _WorkerOutcome(None, _WorkerFailure("timeout", task.operation), elapsed)
+            status, payload = self._connection.recv()
+        except (BrokenPipeError, EOFError, OSError):
+            elapsed = time.monotonic() - started
+            self._stop(graceful=False)
+            return _WorkerOutcome(None, _WorkerFailure("worker_exit", task.operation), elapsed)
+        elapsed = time.monotonic() - started
+        if status == "ok":
+            return _WorkerOutcome(payload, None, elapsed)
+        failure = payload if isinstance(payload, _WorkerFailure) else _WorkerFailure("worker_exit", task.operation)
+        self._stop(graceful=False)
+        return _WorkerOutcome(None, failure, elapsed)
+
+    def close(self) -> None:
+        self._stop(graceful=True)
+
+
+def _session_shell(session: Session) -> Session:
+    return replace(session, impacts=[], swings=[])
+
+
+def _apply_worker_swing(target: Swing, source: Swing) -> None:
+    target.window_start = source.window_start
+    target.window_end = source.window_end
+    target.impact_t = source.impact_t
+    target.tracks = source.tracks
+    target.metadata = source.metadata
+
+
+def _record_swing_failure(swing: Swing, failure: _WorkerFailure) -> None:
+    swing.metadata["tracking_failure_reason"] = failure.reason
+    swing.metadata["tracking_failure_stage"] = failure.stage
+    swing.tracks = [track for track in swing.tracks if track.phase != "swing"]
+    swing.tracks.append(Track(
+        "swing", [],
+        AuditReport(
+            False, [f"phase abstained: {failure.reason}"],
+            {"abstained": 1.0},
+        ),
+        {"failure_stage": failure.stage},
+        True, failure.reason,
+    ))
+    LOG.warning(
+        "swing %s: tracking abstained during %s (%s)",
+        swing.id, failure.stage, failure.reason,
+    )
+
+
 def track_session(
     session: Session,
     config: Config,
@@ -603,40 +825,77 @@ def track_session(
     if any(item not in PHASES for item in selected):
         raise ValueError(f"unknown phase: {phase}")
     for swing in session.swings:
-        swing.tracks = [item for item in swing.tracks if item.phase not in {"club", "follow", "ball"}]
-    for swing in session.swings:
-        club = _club_track(session, swing, config, selected, labels_root)
-        if club is not None:
-            swing.tracks.append(club)
-            if "followthrough" in selected and not club.abstained:
-                swing.tracks.append(_follow_track(
-                    session, swing, club, config, labels_root, detector_weights,
-                ))
-    tee_table: dict[float, tuple[float, float] | None] = {}
-    if "ball" in selected:
-        impact_times = [float(swing.impact_t) for swing in session.swings]
-        shot_priors = {
-            float(swing.impact_t): tuple(track.metadata["impact_xy"])
-            for swing in session.swings
-            for track in swing.tracks
-            if track.phase == "club" and track.metadata.get("impact_xy") is not None
-        }
-        measurement_times = {
-            float(swing.impact_t): float(track.metadata["impact_t"])
-            for swing in session.swings
-            for track in swing.tracks
-            if track.phase == "club" and track.metadata.get("impact_t") is not None
-        }
-        tee_table = estimate_session_tees(
-            session.video, impact_times, config, roi=tee_roi,
-            prior_xy_by_impact=shot_priors,
-            measurement_time_by_impact=measurement_times,
-        )
-    for swing in session.swings:
+        swing.tracks = [item for item in swing.tracks if item.phase not in _TRACK_PHASES]
+        swing.metadata.pop("tracking_failure_reason", None)
+        swing.metadata.pop("tracking_failure_stage", None)
+    shell = _session_shell(session)
+    selected_tuple = tuple(selected)
+    timeout = float(config.track_swing_timeout_s)
+    remaining = {swing.id: timeout for swing in session.swings}
+    failed: set[int] = set()
+    worker = _SwingWorker()
+    try:
+        if any(name in selected for name in ("backswing", "downswing", "followthrough")):
+            for swing in session.swings:
+                outcome = worker.run(_WorkerTask(
+                    "club", shell, config, swing=swing, selected=selected_tuple,
+                    labels_root=labels_root, detector_weights=detector_weights,
+                ), remaining[swing.id])
+                remaining[swing.id] = max(0.0, remaining[swing.id] - outcome.elapsed_s)
+                if outcome.failure is not None:
+                    _record_swing_failure(swing, outcome.failure)
+                    failed.add(swing.id)
+                else:
+                    assert isinstance(outcome.value, Swing)
+                    _apply_worker_swing(swing, outcome.value)
+
+        tee_table: dict[float, tuple[float, float] | None] = {}
         if "ball" in selected:
-            root = debug_dir / f"swing-{swing.id:03d}" if debug_dir is not None else None
-            swing.tracks.append(_ball_track(
-                session, swing, config, root, tee_roi,
-                tee_table.get(float(swing.impact_t)),
-            ))
+            impact_times = tuple(float(swing.impact_t) for swing in session.swings if swing.id not in failed)
+            shot_priors = {
+                float(swing.impact_t): tuple(track.metadata["impact_xy"])
+                for swing in session.swings
+                if swing.id not in failed
+                for track in swing.tracks
+                if track.phase == "club" and track.metadata.get("impact_xy") is not None
+            }
+            measurement_times = {
+                float(swing.impact_t): float(track.metadata["impact_t"])
+                for swing in session.swings
+                if swing.id not in failed
+                for track in swing.tracks
+                if track.phase == "club" and track.metadata.get("impact_t") is not None
+            }
+            if impact_times:
+                tee_outcome = worker.run(_WorkerTask(
+                    "tee_table", shell, config, tee_roi=tee_roi,
+                    impact_times=impact_times, shot_priors=shot_priors,
+                    measurement_times=measurement_times,
+                ), timeout)
+                if tee_outcome.failure is None:
+                    assert isinstance(tee_outcome.value, dict)
+                    tee_table = tee_outcome.value
+                else:
+                    LOG.warning(
+                        "session tee calibration failed (%s); falling back to isolated per-swing measurement",
+                        tee_outcome.failure.reason,
+                    )
+
+            for swing in session.swings:
+                if swing.id in failed:
+                    continue
+                root = debug_dir / f"swing-{swing.id:03d}" if debug_dir is not None else None
+                outcome = worker.run(_WorkerTask(
+                    "ball", shell, config, swing=swing, debug_dir=root,
+                    tee_roi=tee_roi, tee_xy=tee_table.get(float(swing.impact_t)),
+                ), remaining[swing.id])
+                remaining[swing.id] = max(0.0, remaining[swing.id] - outcome.elapsed_s)
+                if outcome.failure is not None:
+                    _record_swing_failure(swing, outcome.failure)
+                    failed.add(swing.id)
+                else:
+                    assert isinstance(outcome.value, Swing)
+                    _apply_worker_swing(swing, outcome.value)
+    finally:
+        worker.close()
     return session
