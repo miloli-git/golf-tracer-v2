@@ -19,7 +19,8 @@ import logging
 LOG = logging.getLogger(__name__)
 
 from .phases.base import (
-    Constraint, InsufficientSupport, SpatialArc, calibration_phase, dedupe_supports, reject_and_fit,
+    Constraint, GeometryOverlength, InsufficientSupport, SpatialArc,
+    calibration_phase, dedupe_supports, reject_and_fit,
 )
 from .phases.backswing import (
     L_WRIST, R_WRIST, _fill_pose, _pose_series, club_observations,
@@ -394,10 +395,27 @@ def _club_track(
     except InsufficientSupport as exc:
         LOG.warning("swing %s: club track abstained (%s)", swing.id, exc)
         return None
-    points, trusted = retime_club_spatial_v1(
-        fit, frames, window_start=start, takeaway_t=takeaway_t, top_t=top_t,
-        impact_t=impact_t, labels=labels, fps=club_fps, config=config,
-    )
+    try:
+        points, trusted = retime_club_spatial_v1(
+            fit, frames, window_start=start, takeaway_t=takeaway_t, top_t=top_t,
+            impact_t=impact_t, labels=labels, fps=club_fps, config=config,
+        )
+    except GeometryOverlength as exc:
+        LOG.warning("swing %s: club track abstained (%s)", swing.id, exc)
+        return Track(
+            "club", [],
+            AuditReport(False, [f"phase abstained: {exc.reason}"], {
+                "geometry_length_px": exc.length_px,
+                "geometry_limit_px": exc.limit_px,
+            }),
+            {
+                "impact_t": impact_t,
+                "geometry_length_px": exc.length_px,
+                "geometry_limit_px": exc.limit_px,
+                "geometry_ray_radius_px": exc.ray_radius_px,
+            },
+            True, exc.reason,
+        )
     back_positions = [item for item in points if item.t <= top_t + 1e-7]
     down_positions = [item for item in points if item.t >= top_t - 1e-7]
     normalized_back = [item for item in labels if item.t <= top_t + 1e-7]
@@ -492,9 +510,28 @@ def _follow_track(
         return Track("follow", [], audit, {
             "impact_t": impact_t, "impact_xy": impact_xy,
         }, True, "insufficient_support")
-    positions = phase.retime(
-        spline, frames[impact_frame:], fps=60.0, start_t=impact_t,
-    )
+    try:
+        positions = phase.retime(
+            spline, frames[impact_frame:], fps=60.0, start_t=impact_t,
+        )
+    except GeometryOverlength as exc:
+        LOG.warning("swing %s: follow track abstained (%s)", swing.id, exc)
+        return Track(
+            "follow", [],
+            AuditReport(False, [f"phase abstained: {exc.reason}"], {
+                "geometry_length_px": exc.length_px,
+                "geometry_limit_px": exc.limit_px,
+            }),
+            {
+                "impact_t": impact_t,
+                "impact_xy": impact_xy,
+                "geometry_length_px": exc.length_px,
+                "geometry_limit_px": exc.limit_px,
+                "geometry_ray_radius_px": exc.ray_radius_px,
+                "evidence_source": evidence_source,
+            },
+            True, exc.reason,
+        )
     accepted_observations = [
         Observation(
             item.frame_index, item.t,
@@ -571,7 +608,7 @@ def track_session(
         club = _club_track(session, swing, config, selected, labels_root)
         if club is not None:
             swing.tracks.append(club)
-            if "followthrough" in selected:
+            if "followthrough" in selected and not club.abstained:
                 swing.tracks.append(_follow_track(
                     session, swing, club, config, labels_root, detector_weights,
                 ))

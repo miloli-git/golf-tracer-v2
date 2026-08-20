@@ -216,6 +216,27 @@ class InsufficientSupport(ValueError):
     """Raised when a phase has too few supports to fit; callers abstain the club track."""
 
 
+class GeometryOverlength(ValueError):
+    """Raised before retiming allocations when a fitted arc is not frame-plausible."""
+
+    reason = "geometry_overlength"
+
+    def __init__(
+        self, length_px: float, limit_px: float, *, ray_radius_px: float | None = None,
+    ):
+        self.length_px = float(length_px)
+        self.limit_px = float(limit_px)
+        self.ray_radius_px = None if ray_radius_px is None else float(ray_radius_px)
+        measured_px = max(
+            self.length_px,
+            self.ray_radius_px if self.ray_radius_px is not None else 0.0,
+        )
+        super().__init__(
+            f"{self.reason}: emission geometry {measured_px:.1f}px exceeds "
+            f"{self.limit_px:.1f}px limit"
+        )
+
+
 def fit_curve(
     supports: Sequence[Constraint], config: Config, label_smoothing_px: float
 ) -> SpatialSpline:

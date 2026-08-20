@@ -39,6 +39,9 @@ class Config:
     club_spline_samples: int = 8192
     club_label_tolerance_px: float = 14.0
     club_arc_bin_px: float = 4.0
+    # Curves longer than this multiple of the decoded-frame diagonal are invalid
+    # fit geometry. Guard before building the arc-sample x shaft-radius emissions.
+    club_max_arc_frame_diagonals: float = 2.0
     club_max_arc_step_px: float = 320.0
     club_retime_accel_weight: float = 0.00020
     club_retime_start_weight: float = 8.0

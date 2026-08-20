@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+from time import perf_counter
+
 import numpy as np
 import pytest
 
 from golftracer.config import Config
 from golftracer.label.schema import Label, LabelDocument, load_labels, save_labels
 from golftracer.phases.followthrough import FollowthroughPhase, detect_finish
-from golftracer.phases.base import dp_sweep
-from golftracer.session import Observation, Swing
+from golftracer.phases.base import GeometryOverlength, SpatialArc, dp_sweep
+from golftracer.phases.backswing import retime_spatial_arc
+from golftracer.session import AuditReport, Observation, Session, Swing, Track
+from golftracer.tracking import _follow_track
 
 
 def _pose() -> np.ndarray:
@@ -82,6 +86,80 @@ def test_followthrough_dp_can_inherit_fast_impact_velocity() -> None:
     assert inherited[1] >= 8
     assert np.all(np.diff(inherited)[:3] >= 8)
     assert default[1] == 0
+
+
+def test_overlength_arc_abstains_before_emission_allocation(monkeypatch) -> None:
+    frames = np.zeros((1, 120, 160, 3), np.uint8)
+    geometry = SpatialArc(
+        np.asarray([0.0, 1_000.0]),
+        np.asarray([[80.0, 100.0], [80.0, -900.0]]),
+    )
+    monkeypatch.setattr(
+        "golftracer.phases.backswing._curve_evidence",
+        lambda *args, **kwargs: pytest.fail("emission allocation was reached"),
+    )
+
+    started = perf_counter()
+    with pytest.raises(GeometryOverlength) as caught:
+        retime_spatial_arc(
+            geometry, frames, fps=60.0, start_t=0.0, labels=[], config=Config(),
+            wrists=np.asarray([[80.0, 60.0]]),
+        )
+
+    assert perf_counter() - started < 0.5
+    assert caught.value.reason == "geometry_overlength"
+    assert caught.value.length_px == pytest.approx(1_000.0)
+    assert caught.value.limit_px == pytest.approx(400.0)
+
+
+def test_overlength_ray_radius_abstains_before_emission_allocation(monkeypatch) -> None:
+    frames = np.zeros((1, 120, 160, 3), np.uint8)
+    geometry = SpatialArc(
+        np.asarray([0.0, 20.0]),
+        np.asarray([[1_000.0, 1_000.0], [1_020.0, 1_000.0]]),
+    )
+    monkeypatch.setattr(
+        "golftracer.phases.backswing._curve_evidence",
+        lambda *args, **kwargs: pytest.fail("emission allocation was reached"),
+    )
+
+    with pytest.raises(GeometryOverlength) as caught:
+        retime_spatial_arc(
+            geometry, frames, fps=60.0, start_t=0.0, labels=[], config=Config(),
+            wrists=np.asarray([[80.0, 60.0]]),
+        )
+
+    assert caught.value.length_px == pytest.approx(20.0)
+    assert caught.value.ray_radius_px is not None
+    assert caught.value.ray_radius_px > caught.value.limit_px
+
+
+def test_follow_track_records_overlength_geometry_abstain(monkeypatch) -> None:
+    frames = np.zeros((121, 120, 160, 3), np.uint8)
+    monkeypatch.setattr(
+        "golftracer.tracking.decode_window", lambda *args, **kwargs: (frames, np.arange(len(frames)) / 60.0),
+    )
+    monkeypatch.setattr(FollowthroughPhase, "track", lambda *args, **kwargs: [])
+    monkeypatch.setattr(FollowthroughPhase, "fit", lambda *args, **kwargs: object())
+
+    def overlength(*args, **kwargs):
+        raise GeometryOverlength(1_000.0, 400.0)
+
+    monkeypatch.setattr(FollowthroughPhase, "retime", overlength)
+    session = Session("fixture.mp4", 160, 120, 60.0, 2.0, 0)
+    swing = Swing(1, 0.0, 2.0, 0.5)
+    club = Track(
+        "club", [Observation(0, 0.5, 80.0, 100.0)], AuditReport(),
+        {"impact_t": 0.5, "impact_xy": (80.0, 100.0)},
+    )
+
+    track = _follow_track(session, swing, club, Config(), None)
+
+    assert track.abstained is True
+    assert track.reason == "geometry_overlength"
+    assert track.observations == []
+    assert track.metadata["geometry_length_px"] == pytest.approx(1_000.0)
+    assert track.metadata["geometry_limit_px"] == pytest.approx(400.0)
 
 
 def test_followthrough_fit_starts_at_exact_downswing_impact() -> None:

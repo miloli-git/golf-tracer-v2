@@ -12,7 +12,7 @@ from ..config import Config
 from ..impacts import pose_model_path
 from ..session import AuditReport, Observation, Swing
 from .base import (
-    Phase, SpatialArc, SpatialSpline, audit_positions, dp_sweep,
+    GeometryOverlength, Phase, SpatialArc, SpatialSpline, audit_positions, dp_sweep,
     fit_label_constrained,
 )
 
@@ -297,6 +297,11 @@ def retime_spatial_arc(
     """
     if not len(frames):
         return []
+    height, width = frames.shape[1:3]
+    arc_limit_px = config.club_max_arc_frame_diagonals * float(np.hypot(width, height))
+    if geometry.length > arc_limit_px:
+        raise GeometryOverlength(geometry.length, arc_limit_px)
+    xy = geometry.xy
     if wrists is None:
         pose = _fill_pose(_pose_series(frames, config))
         if not pose or any(item is None for item in pose):
@@ -307,10 +312,17 @@ def retime_spatial_arc(
         wrists = np.asarray(wrists, dtype=float)
         if len(wrists) != len(frames):
             raise ValueError("wrists must have one row per retimed frame")
+    ray_radius_px = max(
+        float(np.linalg.norm(xy - wrist[None, :], axis=1).max())
+        for wrist in wrists
+    )
+    if ray_radius_px > arc_limit_px:
+        raise GeometryOverlength(
+            geometry.length, arc_limit_px, ray_radius_px=ray_radius_px,
+        )
     gray = np.stack([cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) for frame in frames])
     if background is None:
         background = np.median(gray[:max(1, min(5, len(gray)))], axis=0).astype(np.uint8)
-    xy = geometry.xy
     emissions = []
     for index, frame in enumerate(gray):
         motion = _motion_map(frame, background)
