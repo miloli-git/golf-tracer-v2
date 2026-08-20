@@ -46,6 +46,11 @@ class Config:
     # Curves longer than this multiple of the decoded-frame diagonal are invalid
     # fit geometry. Guard before building the arc-sample x shaft-radius emissions.
     club_max_arc_frame_diagonals: float = 2.0
+    # Impact must remain near the decoded image and move like a struck club. The
+    # reference fits are 115+ px/frame at impact, so this floor is deliberately
+    # conservative while still rejecting stationary fits.
+    club_impact_frame_margin_px: float = 16.0
+    club_min_impact_speed_px_per_frame: float = 30.0
     club_max_arc_step_px: float = 320.0
     club_retime_accel_weight: float = 0.00020
     club_retime_start_weight: float = 8.0

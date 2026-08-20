@@ -350,6 +350,60 @@ def _phase_window(swing: Swing, phase: str, config: Config) -> tuple[float, floa
     return start, config.tee_pre_s + max(config.ball_post_s, config.ball_descent_post_s)
 
 
+def _club_sanity_abstention(
+    positions: Sequence[Observation], *, impact_t: float,
+    frame_width: int, frame_height: int, config: Config,
+) -> Track | None:
+    """Reject a retimed club fit whose impact state is physically invalid."""
+    if not positions:
+        return None
+    impact_xy = (float(positions[-1].x), float(positions[-1].y))
+    steps = [
+        float(np.hypot(second.x - first.x, second.y - first.y))
+        for first, second in zip(positions[-5:-1], positions[-4:])
+    ]
+    impact_speed = float(np.median(steps)) if steps else 0.0
+    margin = float(config.club_impact_frame_margin_px)
+    in_frame = (
+        -margin <= impact_xy[0] <= float(frame_width - 1) + margin
+        and -margin <= impact_xy[1] <= float(frame_height - 1) + margin
+    )
+    if not in_frame:
+        reason = "impact_out_of_frame"
+    elif impact_speed < float(config.club_min_impact_speed_px_per_frame):
+        reason = "impact_speed_too_low"
+    else:
+        return None
+
+    measurements = {
+        "impact_x_px": impact_xy[0],
+        "impact_y_px": impact_xy[1],
+        "impact_speed_px_per_frame": impact_speed,
+        "frame_width_px": float(frame_width),
+        "frame_height_px": float(frame_height),
+        "impact_frame_margin_px": margin,
+        "min_impact_speed_px_per_frame": float(
+            config.club_min_impact_speed_px_per_frame
+        ),
+    }
+    return Track(
+        "club", [],
+        AuditReport(False, [f"phase abstained: {reason}"], measurements),
+        {
+            "impact_t": impact_t,
+            "impact_xy": impact_xy,
+            "impact_speed_px_per_frame": impact_speed,
+            "frame_width_px": frame_width,
+            "frame_height_px": frame_height,
+            "impact_frame_margin_px": margin,
+            "min_impact_speed_px_per_frame": float(
+                config.club_min_impact_speed_px_per_frame
+            ),
+        },
+        True, reason,
+    )
+
+
 def _club_track(
     session: Session,
     swing: Swing,
@@ -451,6 +505,16 @@ def _club_track(
             },
             True, exc.reason,
         )
+    sanity_abstention = _club_sanity_abstention(
+        points, impact_t=impact_t, frame_width=session.width,
+        frame_height=session.height, config=config,
+    )
+    if sanity_abstention is not None:
+        LOG.warning(
+            "swing %s: club track abstained (%s)",
+            swing.id, sanity_abstention.reason,
+        )
+        return sanity_abstention
     back_positions = [item for item in points if item.t <= top_t + 1e-7]
     down_positions = [item for item in points if item.t >= top_t - 1e-7]
     normalized_back = [item for item in labels if item.t <= top_t + 1e-7]
@@ -857,14 +921,16 @@ def track_session(
                 for swing in session.swings
                 if swing.id not in failed
                 for track in swing.tracks
-                if track.phase == "club" and track.metadata.get("impact_xy") is not None
+                if track.phase == "club" and not track.abstained
+                and track.metadata.get("impact_xy") is not None
             }
             measurement_times = {
                 float(swing.impact_t): float(track.metadata["impact_t"])
                 for swing in session.swings
                 if swing.id not in failed
                 for track in swing.tracks
-                if track.phase == "club" and track.metadata.get("impact_t") is not None
+                if track.phase == "club" and not track.abstained
+                and track.metadata.get("impact_t") is not None
             }
             if impact_times:
                 tee_outcome = worker.run(_WorkerTask(
