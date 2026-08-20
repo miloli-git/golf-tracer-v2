@@ -1,0 +1,22 @@
+# Personal footage, labels and launch-monitor data never land here (V2-SCOPE.md "Two repos, two jobs")
+data/
+footage/
+labels/
+*.mp4
+*.mov
+*.MOV
+*.csv
+*.json
+!tests/fixtures/**
+!examples/clip.mp4
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.tmp/
+*.egg-info/
+RUNLOG.md
+weights/*
+!weights/clubhead-yolo26n.pt
+runs/
+/yolo*.pt

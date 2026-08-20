@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "golftracer"
+version = "0.1.0"
+description = "Deterministic golf swing reel compositor"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "av>=12.0",
+  "numpy>=1.26",
+  "opencv-python>=4.9",
+  "pyyaml>=6.0",
+  "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+pose = ["mediapipe>=0.10"]
+detect = [
+  "torch>=2.3",
+  "torchvision>=0.18",
+  "ultralytics>=8.3,<9",
+]
+
+[tool.setuptools.packages.find]
+include = ["golftracer*"]
+
+[project.scripts]
+golftracer = "golftracer.cli:main"
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+markers = ["golden: tests requiring the private external golden manifest"]
