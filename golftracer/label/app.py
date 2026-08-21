@@ -229,8 +229,14 @@ class LabelApp:
             crop = cv2.getRectSubPix(frame, (72, 72), (float(x), float(y)))
             inset = cv2.resize(crop, (216, 216), interpolation=cv2.INTER_CUBIC)
             cv2.drawMarker(inset, (108, 108), (80, 255, 80), cv2.MARKER_CROSS, 30, 1, cv2.LINE_AA)
-            left = 10 if x > frame.shape[1] // 2 else frame.shape[1] - 226
-            frame[64:280, left:left + 216] = inset
+            # Float the loupe beside the cursor, flipping sides so it stays
+            # on-screen and never covers the point being clicked.
+            gap = 28
+            left = x + gap if x + gap + 216 <= frame.shape[1] - 4 else x - gap - 216
+            top = min(max(80, y - 108), frame.shape[0] - 220)
+            left = min(max(4, left), frame.shape[1] - 220)
+            cv2.rectangle(inset, (0, 0), (215, 215), (18, 18, 18), 1)
+            frame[top:top + 216, left:left + 216] = inset
         return frame
 
     def _handle_key(self, key: int) -> None:
