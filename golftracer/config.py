@@ -228,8 +228,8 @@ class Config:
     render_fps_fallback: float = 60.0
     render_lead_s: float = 0.25
     render_post_s: float = 3.60
-    render_alpha_tail: float = 0.35
-    render_alpha_head: float = 1.0
+    render_alpha_tail: float = 0.20
+    render_alpha_head: float = 0.75
     render_glow_alpha_scale: float = 0.40
     club_colour_bgr: tuple[int, int, int] = (60, 220, 255)
     club_width_px: int = 3
