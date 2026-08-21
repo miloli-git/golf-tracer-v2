@@ -228,8 +228,8 @@ class Config:
     render_fps_fallback: float = 60.0
     render_lead_s: float = 0.25
     render_post_s: float = 3.60
-    render_alpha_tail: float = 0.10
-    render_alpha_head: float = 0.90
+    render_alpha_tail: float = 0.35
+    render_alpha_head: float = 1.0
     render_glow_alpha_scale: float = 0.40
     club_colour_bgr: tuple[int, int, int] = (60, 220, 255)
     club_width_px: int = 3
@@ -259,6 +259,10 @@ class Config:
             follow_width_px=2,
             follow_glow_px=0,
             ball_render_arc_fit=False,
+            # v1's exact fade schedule; the parity gate depends on it.
+            render_alpha_tail=0.10,
+            render_alpha_head=0.90,
+            render_glow_alpha_scale=0.40,
         )
 
     @classmethod
